@@ -64,6 +64,23 @@ static int prune_vendor_opts(struct dhcp_netid *netid);
 static struct dhcp_opt *pxe_opts(int pxe_arch, struct dhcp_netid *netid, struct in_addr local, time_t now);
 struct dhcp_boot *find_boot(struct dhcp_netid *netid);
 static int pxe_uefi_workaround(int pxe_arch, struct dhcp_netid *netid, struct dhcp_packet *mess, struct in_addr local, time_t now, int pxe);
+
+static struct dhcp_netid *vendor_forced_netid_filter(struct dhcp_context *context, struct dhcp_netid *netid)
+{
+  struct dhcp_context *context_tmp;
+  for (context_tmp = context; context_tmp; context_tmp = context_tmp->current)
+    {
+      struct dhcp_netid *f;
+      for (f = context_tmp->filter; f; f = f->next)
+        {
+          if (strcmp(f->net, netid->net) == 0)
+            {
+              return netid;
+            }
+        }
+    }
+  return NULL;
+}
   
 size_t dhcp_reply(struct dhcp_context *context, char *iface_name, int int_index,
 		  size_t sz, time_t now, int unicast_dest, int *is_inform, int pxe, struct in_addr fallback)
@@ -98,6 +115,8 @@ size_t dhcp_reply(struct dhcp_context *context, char *iface_name, int int_index,
 #ifdef HAVE_SCRIPT
   unsigned char *class = NULL;
 #endif
+  struct dhcp_netid *ctx_forced_netid_tag = NULL;
+  struct dhcp_context *nwd_context = NULL;
 
   subnet_addr.s_addr = override.s_addr = 0;
 
@@ -452,6 +471,7 @@ size_t dhcp_reply(struct dhcp_context *context, char *iface_name, int int_index,
 	      {
 		vendor->netid.next = netid;
 		netid = &vendor->netid;
+		ctx_forced_netid_tag = vendor_forced_netid_filter(context, netid);
 		break;
 	      }
 	}
@@ -1039,13 +1059,59 @@ size_t dhcp_reply(struct dhcp_context *context, char *iface_name, int int_index,
 	    mess->yiaddr = lease->addr;
 	  else if (opt && address_available(context, addr, tagif_netid) && !lease_find_by_addr(addr) && 
 		   !config_find_by_address(daemon->dhcp_conf, addr))
-	    mess->yiaddr = addr;
+	    {
+	      /* Only accept option 50 either if no tag was forced, or if the tag matches one of the filters
+	       * of the IP range narrowed via option 60.
+	       */
+	      if ((!ctx_forced_netid_tag) ||
+		  (((nwd_context = narrow_context(context, addr, ctx_forced_netid_tag)) != NULL) &&
+		   (nwd_context->filter != NULL) && match_netid(nwd_context->filter, ctx_forced_netid_tag, 0)))
+		{
+		  mess->yiaddr = addr;
+		}
+	      else
+		{
+		  struct dhcp_context *context_tmp;
+		  my_syslog(MS_DHCP | LOG_WARNING, _("ignoring option 50 address because netid tag does not match the pool."));
+		  opt = NULL;
+
+		 for (context_tmp = daemon->dhcp; context_tmp; context_tmp = context_tmp->next)
+		   {
+		     if (address_allocate(context_tmp, &mess->yiaddr, emac, emac_len, ctx_forced_netid_tag, now))
+		       break;
+		   }
+
+		   if (!context_tmp)
+		     message = _("wrong option 50 provided, trying to allocate a new address, no address available");
+
+		   ctx_forced_netid_tag = NULL;
+		}
+	    }
 	  else if (emac_len == 0)
 	    message = _("no unique-id");
 	  else if (!address_allocate(context, &mess->yiaddr, emac, emac_len, tagif_netid, now))
 	    message = _("no address available");      
 	}
       
+      if ((ctx_forced_netid_tag) &&
+	  (((nwd_context = narrow_context(context, mess->yiaddr, ctx_forced_netid_tag)) == NULL) ||
+	   (nwd_context->filter == NULL) || (!match_netid(nwd_context->filter, ctx_forced_netid_tag, 0))))
+	{
+	  struct dhcp_context *context_tmp;
+	   my_syslog(MS_DHCP | LOG_WARNING, _("Wrong IP address found: not matching VID."));
+	   if ((lease) && (mess->yiaddr.s_addr == lease->addr.s_addr))
+	     {
+		lease_prune(lease, now);
+		lease = NULL;
+	     }
+
+	   for (context_tmp = daemon->dhcp; context_tmp; context_tmp = context_tmp->next)
+	     {
+	       if (address_allocate(context_tmp, &mess->yiaddr, emac, emac_len, ctx_forced_netid_tag, now))
+		 break;
+	     }
+	 }
+
       log_packet("DHCPDISCOVER", opt ? option_ptr(opt, 0) : NULL, emac, emac_len, iface_name, NULL, message, mess->xid); 
 
       if (message || !(context = narrow_context(context, mess->yiaddr, tagif_netid)))
@@ -1176,6 +1242,7 @@ size_t dhcp_reply(struct dhcp_context *context, char *iface_name, int int_index,
 	{
 	  struct dhcp_config *addr_config;
 	  struct dhcp_context *tmp = NULL;
+	  struct dhcp_context *nwd_context = NULL;
 	  
 	  if (have_config(config, CONFIG_ADDR))
 	    for (tmp = context; tmp; tmp = tmp->current)
@@ -1190,6 +1257,18 @@ size_t dhcp_reply(struct dhcp_context *context, char *iface_name, int int_index,
 	      unicast_dest = 0;
 	    }
 	  
+	  /* Only accept option 50 either if no tag was forced, or if the tag matches one of the filters
+	   * of the IP range narrowed via option 60.
+	   */
+	  else if ((ctx_forced_netid_tag) &&
+		   (((nwd_context = narrow_context(context, mess->yiaddr, ctx_forced_netid_tag)) == NULL) ||
+		    (nwd_context->filter == NULL) || (match_netid(nwd_context->filter, ctx_forced_netid_tag, 0)) == 0))
+	    {
+	      message = _("wrong VID/Req IP");
+	      /* ensure we broadcast NAK */
+	      unicast_dest = 0;
+	    }
+
 	  /* Check for renewal of a lease which is outside the allowed range. */
 	  else if (!address_available(context, mess->yiaddr, tagif_netid) &&
 		   (!have_config(config, CONFIG_ADDR) || config->addr.s_addr != mess->yiaddr.s_addr))
